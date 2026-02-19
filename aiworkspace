@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""
+Local AI Workspace - Unified Local AI Workbench
+v10: Full-featured AI workspace with notes, tasks, clipboard, snippets, time tracking
+"""
+
+import os, sys, json, subprocess, hashlib, re
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+HOME = Path.home()
+DATA = HOME / ".aiworkspace"
+DATA.mkdir(exist_ok=True)
+
+# All data files
+FILES = {
+    "notes": DATA / "notes.json",
+    "tasks": DATA / "tasks.json", 
+    "clipboard": DATA / "clipboard.json",
+    "snippets": DATA / "snippets.json",
+    "bookmarks": DATA / "bookmarks.json",
+    "time": DATA / "time.json",
+    "links": DATA / "links.json",  # wiki-style links
+    "config": DATA / "config.json",
+}
+
+for k,v in FILES.items():
+    if not v.exists(): v.write_text("[]" if k != "config" else "{}")
+
+def save(f,d): f.write_text(json.dumps(d,indent=2))
+def load(f): return json.loads(f.read_text()) if f.exists() else []
+def ts(): return datetime.now().isoformat()
+def now(): return datetime.now()
+
+# ═══════════════════════════════════════════════════════════════════
+# NOTES
+# ═══════════════════════════════════════════════════════════════════
+class NotesManager:
+    def add(self, title, content, tags=None):
+        notes = load(FILES["notes"])
+        # Process [[wiki-links]]
+        links = re.findall(r'\[\[([^\]]+)\]\]', content)
+        note = {
+            "id": len(notes)+1, "title":title, "content":content,
+            "tags":tags or [], "links":links, "words":len(content.split()),
+            "created":ts(), "updated":ts(),
+        }
+        notes.insert(0, note)
+        save(FILES["notes"], notes)
+        return f"✓ Note: {title} ({note['words']}w)"
+    
+    def list(self, tag=None):
+        notes = load(FILES["notes"])
+        if tag: notes = [n for n in notes if tag in n.get("tags",[])]
+        return "\n".join([f"{i}. {n['title']} [{','.join(n.get('tags',[]))}]" for i,n in enumerate(notes[:20])]) or "No notes"
+    
+    def get(self, idx):
+        notes = load(FILES["notes"])
+        if 0 <= idx < len(notes):
+            n = notes[idx]
+            return f"# {n['title']}\n\n{n['content']}"
+        return "Invalid"
+    
+    def search(self, query):
+        notes = load(FILES["notes"])
+        r = [n for n in notes if query.lower() in n["title"].lower() or query.lower() in n["content"].lower()]
+        return "\n".join([f"- {n['title']}" for n in r[:10]]) or "No results"
+    
+    def backlinks(self, title):
+        notes = load(FILES["notes"])
+        r = [n for n in notes if f"[[{title}]]" in n["content"]]
+        return "\n".join([f"- {n['title']}" for n in r]) or "No backlinks"
+    
+    def delete(self, idx):
+        notes = load(FILES["notes"])
+        if 0 <= idx < len(notes):
+            notes.pop(idx)
+            save(FILES["notes"], notes)
+            return "✓ Deleted"
+        return "Invalid"
+
+# ═══════════════════════════════════════════════════════════════════
+# TASKS
+# ═══════════════════════════════════════════════════════════════════
+class TaskManager:
+    PRIORITIES = {1:"🔴",2:"🟠",3:"🟡",4:"🟢",5:"⚪"}
+    
+    def add(self, task, priority=3, tag=None, due=None):
+        tasks = load(FILES["tasks"])
+        t = {
+            "id":len(tasks)+1,"task":task,"priority":priority,
+            "tag":tag,"due":due,"done":False,
+            "created":ts()
+        }
+        tasks.append(t)
+        save(FILES["tasks"], tasks)
+        return f"✓ Added: {self.PRIORITIES.get(priority,'⚪')} {task[:40]}"
+    
+    def list(self, pending=True, tag=None):
+        tasks = load(FILES["tasks"])
+        if pending: tasks = [t for t in tasks if not t.get("done")]
+        if tag: tasks = [t for t in tasks if t.get("tag")==tag]
+        tasks.sort(key=lambda x: x.get("priority",3))
+        return "\n".join([f"{'✓' if t.get('done') else self.PRIORITIES.get(t.get('priority',3),'⚪')} {t['task'][:50]}" for t in tasks[:20]]) or "No tasks"
+    
+    def done(self, idx):
+        tasks = load(FILES["tasks"])
+        if 0 <= idx < len(tasks):
+            tasks[idx]["done"] = True
+            tasks[idx]["done_at"] = ts()
+            save(FILES["tasks"], tasks)
+            return f"✓ Done: {tasks[idx]['task'][:40]}"
+        return "Invalid"
+    
+    def delete(self, idx):
+        tasks = load(FILES["tasks"])
+        if 0 <= idx < len(tasks):
+            tasks.pop(idx)
+            save(FILES["tasks"], tasks)
+            return "✓ Deleted"
+        return "Invalid"
+
+# ═══════════════════════════════════════════════════════════════════
+# CLIPBOARD
+# ═══════════════════════════════════════════════════════════════════
+class ClipboardManager:
+    def save(self, text=None, tag=None):
+        text = text or subprocess.run(["pbpaste"],capture_output=True,text=True).stdout
+        if not text: return "Empty"
+        h = load(FILES["clipboard"])
+        h.insert(0,{"text":text[:3000],"tag":tag,"ts":ts(),"hash":hashlib.md5(text.encode[:8]})
+()).hexdigest()        save(FILES["clipboard"], h[:500])
+        return f"✓ Saved: {text[:30]}..."
+    
+    def list(self, limit=15):
+        h = load(FILES["clipboard"])
+        return "\n".join([f"{i}. {x['text'][:50]}" for i,x in enumerate(h[:limit])]) or "Empty"
+    
+    def paste(self, idx=0):
+        h = load(FILES["clipboard"])
+        if 0 <= idx < len(h):
+            subprocess.run(["pbcopy"],input=h[idx]["text"])
+            return f"✓ Pasted"
+        return "Invalid"
+
+# ═══════════════════════════════════════════════════════════════════
+# TIME TRACKING
+# ═══════════════════════════════════════════════════════════════════
+class TimeTracker:
+    def start(self, project):
+        t = load(FILES["time"])
+        for x in t: x.get("end") or x.update({"end":ts()})
+        t.append({"project":project,"start":ts(),"end":None})
+        save(FILES["time"], t)
+        return f"⏱️ Started: {project}"
+    
+    def stop(self):
+        t = load(FILES["time"])
+        for x in reversed(t):
+            if x.get("end") is None:
+                x["end"] = ts()
+                save(FILES["time"], t)
+                start, end = datetime.fromisoformat(x["start"]), datetime.fromisoformat(x["end"])
+                mins = int((end-start).total_seconds()/60)
+                return f"✓ {x['project']}: {mins}m"
+        return "No timer"
+    
+    def list(self, days=7):
+        t = load(FILES["time"])
+        cutoff = now() - timedelta(days=days)
+        t = [x for x in t if datetime.fromisoformat(x["start"]) > cutoff]
+        return "\n".join([f"- {x['project']}: {x['start'][:16]}" for x in t[-15:]]) or "No entries"
+
+# ═══════════════════════════════════════════════════════════════════
+# BOOKMARKS
+# ═══════════════════════════════════════════════════════════════════
+class BookmarkManager:
+    def add(self, name, url, tag=None):
+        b = load(FILES["bookmarks"])
+        b.append({"name":name,"url":url,"tag":tag,"ts":ts()})
+        save(FILES["bookmarks"], b)
+        return f"✓ {name}"
+    
+    def list(self, tag=None):
+        b = load(FILES["bookmarks"])
+        if tag: b = [x for x in b if x.get("tag")==tag]
+        return "\n".join([f"- {x['name']}: {x['url']}" for x in b]) or "No bookmarks"
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════
+notes = NotesManager()
+tasks = TaskManager()
+clip = ClipboardManager()
+time = TimeTracker()
+bookmarks = BookmarkManager()
+
+import argparse
+p = argparse.ArgumentParser(prog="aiworkspace")
+sp = p.add_subparsers(dest="cmd",required=True)
+
+# Notes
+n = sp.add_parser("note")
+n.add_argument("action",nargs="?",choices=["add","list","get","search","backlinks","delete"])
+n.add_argument("args",nargs="*")
+n.add_argument("--tag")
+
+# Tasks
+t = sp.add_parser("task")
+t.add_argument("action",nargs="?",choices=["add","list","done","delete"])
+t.add_argument("args",nargs="*")
+t.add_argument("--priority",type=int,default=3)
+t.add_argument("--tag")
+
+# Clipboard
+sp.add_parser("clip").add_argument("action",nargs="?",choices=["save","list","paste"])
+
+# Time
+ti = sp.add_parser("time")
+ti.add_argument("action",nargs="?",choices=["start","stop","list"])
+ti.add_argument("project")
+
+# Bookmarks
+b = sp.add_parser("book")
+b.add_argument("action",nargs="?",choices=["add","list"])
+b.add_argument("args",nargs="*")
+b.add_argument("--tag")
+
+# Dashboard
+sp.add_parser("dash")
+
+args = p.parse_args()
+
+if args.cmd == "note":
+    act = args.action or "list"
+    if act == "add": print(notes.add(args.args[0]," ".join(args.args[1:]) if args.args else "", args.tag))
+    elif act == "list": print(notes.list(args.tag))
+    elif act == "get": print(notes.get(int(args.args[0]) if args.args else 0)
+    elif act == "search": print(notes.search(args.args[0] if args.args else ""))
+    elif act == "backlinks": print(notes.backlinks(args.args[0] if args.args else ""))
+    elif act == "delete": print(notes.delete(int(args.args[0]) if args.args else 0)
+
+elif args.cmd == "task":
+    act = args.action or "list"
+    if act == "add": print(tasks.add(" ".join(args.args) if args.args else "","", args.priority, args.tag))
+    elif act == "list": print(tasks.list(tag=args.tag))
+    elif act == "done": print(tasks.done(int(args.args[0]) if args.args else 0))
+    elif act == "delete": print(tasks.delete(int(args.args[0]) if args.args else 0))
+
+elif args.cmd == "clip":
+    act = args.action or "list"
+    if act == "save": print(clip.save())
+    elif act == "list": print(clip.list())
+    elif act == "paste": print(clip.paste(int(args.args[0]) if args.args else 0)
+
+elif args.cmd == "time":
+    act = args.action or "list"
+    if act == "start": print(time.start(args.project or "default"))
+    elif act == "stop": print(time.stop())
+    elif act == "list": print(time.list())
+
+elif args.cmd == "book":
+    act = args.action or "list"
+    if act == "add": print(bookmarks.add(args.args[0],args.args[1] if len(args.args)>1 else "",args.tag))
+    elif act == "list": print(bookmarks.list(args.tag))
+
+elif args.cmd == "dash":
+    print("""
+╔═══════════════════════════════════════╗
+║    Local AI Workspace v10           ║
+╠═══════════════════════════════════════╣
+║  Unified local AI workbench        ║
+║  Notes + Tasks + Clipboard         ║
+║  + Time Tracking + Bookmarks       ║
+╚═══════════════════════════════════════╝
+    """)
+
+else: print("Local AI Workspace v10 ready!")
